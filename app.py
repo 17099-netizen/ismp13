@@ -2,23 +2,26 @@ import os
 import cv2
 import numpy as np
 import urllib.request
-import pickle
+import requests
+import binascii
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app) # อนุญาตให้เว็บจำลองเรียกใช้งานได้
+CORS(app)
 
 # ---------------------------------------------------------
-# 🔒 ตั้งค่า API KEY (รหัสผ่านสำหรับเข้าใช้ API)
-# คุณสามารถเปลี่ยนข้อความ "my_secret_key_12345" เป็นรหัสของคุณเองได้เลย
+# 🔒 secrets — ใส่ใน Render Environment Variables
 # ---------------------------------------------------------
-API_KEY = os.environ.get("API_KEY", "my_secret_key_12345")
+API_KEY       = os.environ.get("API_KEY",       "my_secret_key_12345")
+RENDER_SECRET = os.environ.get("RENDER_SECRET", "REPLACE_WITH_LONG_RANDOM_SECRET_64CHARS")
+PHP_API_URL   = os.environ.get("PHP_API_URL",   "https://dkt.gt.tc/face_vectors_api")
 
-DATA_FILE = "known_faces.pkl"
-
-YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-SFACE_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+# ---------------------------------------------------------
+# โหลดโมเดล
+# ---------------------------------------------------------
+YUNET_URL  = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+SFACE_URL  = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 YUNET_PATH = "face_detection_yunet.onnx"
 SFACE_PATH = "face_recognition_sface.onnx"
 
@@ -32,144 +35,154 @@ def download_models():
 
 download_models()
 
-detector = cv2.FaceDetectorYN.create(YUNET_PATH, "", (320, 320))
+detector   = cv2.FaceDetectorYN.create(YUNET_PATH, "", (320, 320))
 recognizer = cv2.FaceRecognizerSF.create(SFACE_PATH, "")
 
-def load_known_faces():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "rb") as f:
-            return pickle.load(f)
-    return {}
-
-def save_known_faces(known_faces):
-    with open(DATA_FILE, "wb") as f:
-        pickle.dump(known_faces, f)
-
-known_faces = load_known_faces()
+# ---------------------------------------------------------
+# Helper headers สำหรับเรียก PHP API
+# ---------------------------------------------------------
+def php_headers():
+    return {
+        "Authorization": f"Bearer {RENDER_SECRET}",
+        "User-Agent":    "python-requests/face-api",
+        "Content-Type":  "application/json",
+    }
 
 # ---------------------------------------------------------
-# ฟังก์ชันตรวจสอบ API Key
+# แปลง numpy ↔ hex
+# ---------------------------------------------------------
+def vec_to_hex(arr):
+    return binascii.hexlify(arr.astype(np.float32).tobytes()).decode('ascii')
+
+def hex_to_vec(h):
+    return np.frombuffer(binascii.unhexlify(h), dtype=np.float32)
+
+# ---------------------------------------------------------
+# known_faces cache (in-memory)
+# ---------------------------------------------------------
+known_faces = {}
+
+def load_from_db():
+    global known_faces
+    try:
+        resp = requests.get(PHP_API_URL, headers=php_headers(), timeout=30)
+        if resp.status_code != 200:
+            print(f"[WARN] PHP API {resp.status_code}: {resp.text[:200]}")
+            return
+        data = resp.json().get("data", {})
+        known_faces = {uid: [hex_to_vec(h) for h in entry["vectors"]] for uid, entry in data.items()}
+        total = sum(len(v) for v in known_faces.values())
+        print(f"[INFO] Loaded {total} vectors for {len(known_faces)} users from MySQL")
+    except Exception as e:
+        print(f"[ERROR] load_from_db: {e}")
+
+def save_to_db(user_id, role_type, vectors):
+    payload = {"user_id": user_id, "role_type": role_type, "vectors": [vec_to_hex(v) for v in vectors]}
+    resp = requests.post(PHP_API_URL, json=payload, headers=php_headers(), timeout=30)
+    return resp.status_code == 200, resp.json()
+
+# โหลดตอน startup
+load_from_db()
+
 # ---------------------------------------------------------
 def require_api_key(req):
-    # ตรวจสอบ Key จาก Headers หรือ Form Data
-    key = req.headers.get('x-api-key')
-    if not key:
-        key = req.form.get('api_key')
+    key = req.headers.get('x-api-key') or req.form.get('api_key')
     return key == API_KEY
 
-# ---------------------------------------------------------
-# ฟังก์ชันจำลองการใส่หน้ากากอนามัย (Virtual Mask)
-# ---------------------------------------------------------
 def add_virtual_mask(img, face_data):
-    masked_img = img.copy()
+    masked = img.copy()
     x, y, w, h = int(face_data[0]), int(face_data[1]), int(face_data[2]), int(face_data[3])
     nose_y = int(face_data[9])
-    
-    mask_top = max(0, nose_y - int(h * 0.05))
-    mask_bottom = min(img.shape[0], y + h)
-    x_start = max(0, x)
-    x_end = min(img.shape[1], x + w)
-    
-    cv2.rectangle(masked_img, (x_start, mask_top), (x_end, mask_bottom), (255, 255, 255), -1)
-    return masked_img
+    cv2.rectangle(masked, (max(0,x), max(0, nose_y - int(h*0.05))),
+                  (min(img.shape[1], x+w), min(img.shape[0], y+h)), (255,255,255), -1)
+    return masked
 
-def get_face_data(img):
-    height, width, _ = img.shape
-    detector.setInputSize((width, height))
+def get_face(img):
+    detector.setInputSize((img.shape[1], img.shape[0]))
     faces = detector.detect(img)
-    if faces[1] is None:
-        return None
-    return faces[1][0]
+    return None if faces[1] is None else faces[1][0]
 
+# ---------------------------------------------------------
+# Routes
+# ---------------------------------------------------------
 @app.route("/")
 def index():
-    return jsonify({"status": "Face API is running securely. API Key required."})
+    return jsonify({"status": "running", "users": len(known_faces),
+                    "vectors": sum(len(v) for v in known_faces.values())})
+
+@app.route("/reload", methods=["POST"])
+def reload_route():
+    if not require_api_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    load_from_db()
+    return jsonify({"status": "reloaded", "users": len(known_faces)})
 
 @app.route("/register", methods=["POST"])
 def register():
-    # ตรวจสอบรหัสผ่านก่อนทำงาน
     if not require_api_key(request):
-        return jsonify({"error": "Unauthorized: Invalid or missing API Key"}), 401
-        
+        return jsonify({"error": "Unauthorized"}), 401
     if 'file' not in request.files or 'id' not in request.form:
-        return jsonify({"error": "Missing 'file' or 'id'"}), 400
-        
-    student_id = str(request.form['id']).strip()
-    file = request.files['file']
-    
-    nparr = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return jsonify({"error": "Missing file or id"}), 400
+
+    uid       = str(request.form['id']).strip()
+    role_type = str(request.form.get('role', 'student')).strip().lower()
+    if role_type not in ('student', 'teacher'):
+        role_type = 'student'
+
+    nparr = np.frombuffer(request.files['file'].read(), np.uint8)
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
-        return jsonify({"error": "Invalid image format"}), 400
-        
-    face = get_face_data(img)
+        return jsonify({"error": "Invalid image"}), 400
+
+    face = get_face(img)
     if face is None:
-        return jsonify({"error": "No face detected in the image"}), 400
-        
-    if student_id not in known_faces:
-        known_faces[student_id] = []
-        
-    # 1. สกัดจุดเด่นหน้าปกติ
-    aligned_normal = recognizer.alignCrop(img, face)
-    feature_normal = recognizer.feature(aligned_normal)
-    known_faces[student_id].append(feature_normal)
-    
-    # 2. จำลองใส่แมสและสกัดจุดเด่น
-    masked_img = add_virtual_mask(img, face)
-    aligned_masked = recognizer.alignCrop(masked_img, face)
-    feature_masked = recognizer.feature(aligned_masked)
-    known_faces[student_id].append(feature_masked)
-    
-    save_known_faces(known_faces)
-    return jsonify({"message": f"Successfully registered ID: {student_id} (Normal & Masked saved)"}), 200
+        return jsonify({"error": "No face detected"}), 400
+
+    f_normal = recognizer.feature(recognizer.alignCrop(img, face))
+    f_masked = recognizer.feature(recognizer.alignCrop(add_virtual_mask(img, face), face))
+    vectors  = [f_normal, f_masked]
+
+    ok, api_resp = save_to_db(uid, role_type, vectors)
+    if not ok:
+        return jsonify({"error": f"DB save failed: {api_resp}"}), 500
+
+    known_faces[uid] = vectors
+    return jsonify({"message": f"Successfully registered ID: {uid} (Normal & Masked saved)",
+                    "saved_to": "MySQL via PHP API"}), 200
 
 @app.route("/recognize", methods=["POST"])
 def recognize():
-    # ตรวจสอบรหัสผ่านก่อนทำงาน
     if not require_api_key(request):
-        return jsonify({"error": "Unauthorized: Invalid or missing API Key"}), 401
-        
+        return jsonify({"error": "Unauthorized"}), 401
     if 'file' not in request.files:
-        return jsonify({"error": "Missing 'file'"}), 400
-        
+        return jsonify({"error": "Missing file"}), 400
     if not known_faces:
         return jsonify({"error": "No faces registered"}), 400
-        
-    file = request.files['file']
-    nparr = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    nparr = np.frombuffer(request.files['file'].read(), np.uint8)
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
-        return jsonify({"error": "Invalid image format"}), 400
-        
-    face = get_face_data(img)
+        return jsonify({"error": "Invalid image"}), 400
+
+    face = get_face(img)
     if face is None:
         return jsonify({"error": "No face detected"}), 400
-        
-    aligned_face = recognizer.alignCrop(img, face)
-    feature = recognizer.feature(aligned_face)
-        
-    best_match_id = None
-    best_score = 0.0
-    THRESHOLD = 0.28  # ลดจาก 0.34 → 0.28 รองรับแสงและมุมที่ต่างจากตอน register
 
-    for student_id, features_list in known_faces.items():
-        if isinstance(features_list, list):
-            for known_feature in features_list:
-                score = recognizer.match(known_feature, feature, cv2.FaceRecognizerSF_FR_COSINE)
-                if score > best_score:
-                    best_score = score
-                    best_match_id = student_id
-        else:
-            score = recognizer.match(features_list, feature, cv2.FaceRecognizerSF_FR_COSINE)
-            if score > best_score:
-                best_score = score
-                best_match_id = student_id
+    feat = recognizer.feature(recognizer.alignCrop(img, face))
 
+    best_id, best_score = None, 0.0
+    THRESHOLD = 0.28
+
+    for uid, vecs in known_faces.items():
+        for v in vecs:
+            s = recognizer.match(v, feat, cv2.FaceRecognizerSF_FR_COSINE)
+            if s > best_score:
+                best_score, best_id = s, uid
+
+    score = round(float(best_score), 4)
     if best_score >= THRESHOLD:
-        return jsonify({"id": best_match_id, "score": round(float(best_score), 4)}), 200
-    else:
-        # คืน 200 พร้อม error field — ไม่ใช่ 404 เพื่อไม่ให้ PHP เข้าใจผิดว่า server error
-        return jsonify({"error": "Unknown face", "score": round(float(best_score), 4)}), 200
+        return jsonify({"id": best_id, "score": score}), 200
+    return jsonify({"error": "Unknown face", "score": score}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
