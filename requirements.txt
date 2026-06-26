@@ -4,3 +4,4 @@ opencv-python-headless
 numpy
 gunicorn==21.2.0
 requests
+flask-cors
