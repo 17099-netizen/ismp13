@@ -150,8 +150,8 @@ def recognize():
         
     best_match_id = None
     best_score = 0.0
-    THRESHOLD = 0.34 # ลดความเข้มงวดลงเพื่อให้รองรับการใส่แมส
-    
+    THRESHOLD = 0.28  # ลดจาก 0.34 → 0.28 รองรับแสงและมุมที่ต่างจากตอน register
+
     for student_id, features_list in known_faces.items():
         if isinstance(features_list, list):
             for known_feature in features_list:
@@ -164,11 +164,12 @@ def recognize():
             if score > best_score:
                 best_score = score
                 best_match_id = student_id
-            
+
     if best_score >= THRESHOLD:
-        return jsonify({"id": best_match_id}), 200
+        return jsonify({"id": best_match_id, "score": round(float(best_score), 4)}), 200
     else:
-        return jsonify({"error": "Unknown face"}), 404
+        # คืน 200 พร้อม error field — ไม่ใช่ 404 เพื่อไม่ให้ PHP เข้าใจผิดว่า server error
+        return jsonify({"error": "Unknown face", "score": round(float(best_score), 4)}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
