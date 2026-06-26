@@ -11,15 +11,12 @@ app = Flask(__name__)
 CORS(app)
 
 # ---------------------------------------------------------
-# 🔒 ตั้งค่า API KEY
+# 🔒 ตั้งค่า API KEY และ CONFIG
 # ---------------------------------------------------------
 API_KEY = os.environ.get("API_KEY", "my_secret_key_12345")
 
-# ---------------------------------------------------------
-# 🗄️ ตั้งค่า Database MySQL (Aiven)
-# ---------------------------------------------------------
 DB_HOST = os.environ.get("DB_HOST", "mysql-36feea8e-chaiyanan-18aa.l.aivencloud.com")
-DB_PORT = int(os.environ.get("DB_PORT", 16338)) # Aiven ใช้ Port พิเศษ
+DB_PORT = int(os.environ.get("DB_PORT", 16338))
 DB_USER = os.environ.get("DB_USER", "avnadmin")
 DB_PASS = os.environ.get("DB_PASS", "AVNS_mWh0__PWvXDxgp88P0u")
 DB_NAME = os.environ.get("DB_NAME", "defaultdb")
@@ -41,7 +38,7 @@ detector = cv2.FaceDetectorYN.create(YUNET_PATH, "", (320, 320))
 recognizer = cv2.FaceRecognizerSF.create(SFACE_PATH, "")
 
 # ---------------------------------------------------------
-# ฟังก์ชันเชื่อมต่อ Aiven MySQL (บังคับ SSL)
+# 🗄️ ฟังก์ชันจัดการฐานข้อมูล Aiven (MySQL SSL)
 # ---------------------------------------------------------
 def get_db_connection():
     return pymysql.connect(
@@ -51,7 +48,7 @@ def get_db_connection():
         password=DB_PASS,
         database=DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
-        ssl={'ssl': {}} # Aiven ต้องการการเชื่อมต่อผ่าน SSL
+        ssl={'ssl': {}} 
     )
 
 def init_db():
@@ -62,9 +59,9 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS face_embeddings (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     user_id VARCHAR(50) NOT NULL,
-                    feature_data JSON NOT NULL,
+                    feature_data LONGTEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
         conn.commit()
         conn.close()
@@ -105,14 +102,12 @@ def save_face_to_db(user_id, feature):
     except Exception as e:
         print(f"Error saving to Aiven DB: {e}")
 
-# ถ้าเริ่มเซิร์ฟเวอร์ ให้เชื่อมต่อและโหลดข้อมูลทันที
-if DB_HOST:
-    init_db()
-    known_faces = load_known_faces()
-else:
-    known_faces = {}
-    print("Waiting for Database Environment Variables...")
+init_db()
+known_faces = load_known_faces()
 
+# ---------------------------------------------------------
+# 🛠️ ฟังก์ชันช่วยเหลือ (Helpers)
+# ---------------------------------------------------------
 def require_api_key(req):
     key = req.headers.get('x-api-key') or req.form.get('api_key')
     return key == API_KEY
@@ -132,6 +127,9 @@ def get_face_data(img):
     faces = detector.detect(img)
     return faces[1][0] if faces[1] is not None else None
 
+# ---------------------------------------------------------
+# 🌐 API Routes ต่างๆ
+# ---------------------------------------------------------
 @app.route("/")
 def index():
     return jsonify({"status": f"Face API is running on Aiven. Loaded {len(known_faces)} users."})
@@ -195,6 +193,37 @@ def recognize():
     if best_score >= THRESHOLD:
         return jsonify({"id": best_match_id}), 200
     return jsonify({"error": "Unknown face"}), 404
+
+# 📋 ดึงรายชื่อไอดีทั้งหมดที่มีในระบบแอปพลิเคชัน
+@app.route("/get_registered_ids", methods=["GET"])
+def get_registered_ids():
+    if not require_api_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify({"registered_ids": list(known_faces.keys())}), 200
+
+# ❌ ลบข้อมูลใบหน้าตามไอดีออกจากระบบถาวร
+@app.route("/delete_face", methods=["POST"])
+def delete_face():
+    if not require_api_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    if 'id' not in request.form:
+        return jsonify({"error": "Missing ID"}), 400
+        
+    user_id = str(request.form['id']).strip()
+    if user_id not in known_faces:
+        return jsonify({"error": "ไม่พบรหัสใบนี้ในระบบ"}), 404
+        
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM face_embeddings WHERE user_id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        
+        del known_faces[user_id]
+        return jsonify({"message": f"ลบข้อมูลใบหน้ารหัส {user_id} ออกจากระบบเรียบร้อยแล้ว"}), 200
+    except Exception as e:
+        return jsonify({"error": f"Database Error: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
