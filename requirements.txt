@@ -5,3 +5,4 @@ numpy
 gunicorn==21.2.0
 requests
 flask-cors
+PyMySQL
